@@ -886,7 +886,7 @@ player = FirstPersonController(
     position=(0, 15, 0),
     speed=NORMAL_SPEED,
     jump_height=1.5,
-    gravity=0.7,
+    gravity=0.5,
 )
 
 player.height = PLAYER_HEIGHT
