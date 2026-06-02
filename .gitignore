@@ -1,0 +1,12 @@
+@"
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+venv/
+.venv/
+voxel_world_save.json
+.DS_Store
+Thumbs.db
+"@ | Set-Content .gitignore
