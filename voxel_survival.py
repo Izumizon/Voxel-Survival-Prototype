@@ -54,6 +54,7 @@ DAY_LENGTH_SECONDS = 90.0
 UI_REFRESH_SECONDS = 0.1
 CHUNK_SIZE = 16
 RENDER_DISTANCE = 2
+COLLIDER_DISTANCE = 1
 GENERATION_DISTANCE = RENDER_DISTANCE + 1
 CHUNK_STREAM_UPDATE_SECONDS = 0.25
 MAX_CHUNK_GENERATIONS_PER_FRAME = 1
@@ -61,6 +62,13 @@ MAX_CHUNK_REBUILDS_PER_FRAME = 2
 MAX_CHUNK_UNLOADS_PER_FRAME = 2
 MIN_RENDER_DISTANCE = 1
 MAX_RENDER_DISTANCE = 5
+MIN_COLLIDER_DISTANCE = 1
+MIN_CHUNK_GENERATIONS_PER_FRAME = 1
+MAX_CHUNK_GENERATIONS_SETTING = 3
+MIN_CHUNK_REBUILDS_PER_FRAME = 1
+MAX_CHUNK_REBUILDS_SETTING = 4
+MIN_CHUNK_UNLOADS_PER_FRAME = 1
+MAX_CHUNK_UNLOADS_SETTING = 6
 MOUSE_SENSITIVITY = 40
 MOUSE_SENSITIVITY_STEP = 5
 MIN_MOUSE_SENSITIVITY = 10
@@ -143,6 +151,9 @@ dirty_chunks = set()
 chunk_generation_queue = deque()
 queued_chunk_generations = set()
 desired_render_chunks = set()
+desired_collider_chunks = set()
+desired_generation_chunks = set()
+chunk_collider_states = {}
 
 inventory = {
     "grass": 10,
@@ -170,6 +181,7 @@ status_message_timer = 0.0
 ui_update_timer = 0.0
 chunk_stream_update_timer = 0.0
 last_player_chunk = None
+world_initialized = False
 
 
 # ------------------------------------------------------------
@@ -394,6 +406,7 @@ def rebuild_chunk(chunk_coord):
         destroy(entity)
 
     entities = []
+    collider_type = "mesh" if chunk_coord in desired_collider_chunks else None
 
     opaque_blocks = set(BLOCK_ORDER) - TRANSPARENT_BLOCKS
     opaque_mesh = build_chunk_mesh(chunk_coord, opaque_blocks)
@@ -402,7 +415,7 @@ def rebuild_chunk(chunk_coord):
             Entity(
                 parent=scene,
                 model=opaque_mesh,
-                collider="mesh",
+                collider=collider_type,
                 chunk_coord=chunk_coord,
                 chunk_mesh_type="opaque",
                 is_chunk_mesh=True,
@@ -415,7 +428,7 @@ def rebuild_chunk(chunk_coord):
             Entity(
                 parent=scene,
                 model=transparent_mesh,
-                collider="mesh",
+                collider=collider_type,
                 double_sided=True,
                 chunk_coord=chunk_coord,
                 chunk_mesh_type="transparent",
@@ -427,6 +440,7 @@ def rebuild_chunk(chunk_coord):
         chunks[chunk_coord] = entities
     else:
         chunks[chunk_coord] = []
+    chunk_collider_states[chunk_coord] = collider_type is not None
 
 
 def rebuild_dirty_chunks():
@@ -448,6 +462,7 @@ def destroy_all_chunk_meshes():
             destroy(entity)
 
     chunks.clear()
+    chunk_collider_states.clear()
     dirty_chunk_queue.clear()
     dirty_chunks.clear()
 
@@ -469,6 +484,7 @@ def unload_chunk(chunk_coord):
     for entity in chunks.pop(chunk_coord, ()):
         destroy(entity)
 
+    chunk_collider_states.pop(chunk_coord, None)
     dirty_chunks.discard(chunk_coord)
 
 
@@ -634,11 +650,19 @@ def generate_chunk(chunk_coord):
 
 
 def generate_initial_world():
-    """Generate a small safe starting area before the first rendered frame."""
+    """Generate a small safe starting area when singleplayer begins."""
+    global last_player_chunk
+
     world_data.clear()
     chunk_blocks.clear()
     generated_chunks.clear()
     destroy_all_chunk_meshes()
+    chunk_generation_queue.clear()
+    queued_chunk_generations.clear()
+    desired_render_chunks.clear()
+    desired_collider_chunks.clear()
+    desired_generation_chunks.clear()
+    last_player_chunk = None
 
     for chunk_x in range(-1, 2):
         for chunk_z in range(-1, 2):
@@ -662,9 +686,25 @@ def chunk_square(center, distance):
     )
 
 
+def refresh_chunk_collider_targets(immediate_player_chunk=False):
+    """Queue collider changes while immediately protecting the current chunk."""
+    player_chunk = chunk_coord_from_block((player.x, 0, player.z))
+
+    for chunk_coord in list(chunks):
+        collider_enabled = chunk_coord in desired_collider_chunks
+        if chunk_collider_states.get(chunk_coord, False) == collider_enabled:
+            continue
+
+        if immediate_player_chunk and chunk_coord == player_chunk:
+            rebuild_chunk(chunk_coord)
+        else:
+            mark_chunk_dirty(chunk_coord)
+
+
 def schedule_chunks_around_player(force=False):
-    """Queue nearby generation and visual loading around the player."""
-    global desired_render_chunks, last_player_chunk
+    """Queue nearby generation, rendering, and collider updates around the player."""
+    global desired_render_chunks, desired_collider_chunks
+    global desired_generation_chunks, last_player_chunk
 
     player_chunk = chunk_coord_from_block((player.x, 0, player.z))
     if not force and player_chunk == last_player_chunk:
@@ -672,12 +712,19 @@ def schedule_chunks_around_player(force=False):
 
     last_player_chunk = player_chunk
     desired_render_chunks = set(chunk_square(player_chunk, RENDER_DISTANCE))
+    desired_collider_chunks = set(chunk_square(player_chunk, COLLIDER_DISTANCE))
+    desired_generation_chunks = set(chunk_square(player_chunk, GENERATION_DISTANCE))
 
+    # Reprioritise pending work so stale requests never delay nearby terrain.
+    chunk_generation_queue.clear()
+    queued_chunk_generations.clear()
     for chunk_coord in chunk_square(player_chunk, GENERATION_DISTANCE):
         queue_chunk_generation(chunk_coord)
 
     for chunk_coord in desired_render_chunks:
         activate_chunk(chunk_coord)
+
+    refresh_chunk_collider_targets(immediate_player_chunk=True)
 
 
 def process_chunk_streaming():
@@ -738,7 +785,7 @@ def save_world():
 
 def load_world():
     """Load chunk-grouped world data and restore nearby rendered chunks."""
-    global selected_index, health, hunger
+    global selected_index, health, hunger, last_player_chunk, world_initialized
 
     if not os.path.exists(SAVE_FILE):
         set_status("No save file found.")
@@ -753,6 +800,10 @@ def load_world():
     destroy_all_chunk_meshes()
     chunk_generation_queue.clear()
     queued_chunk_generations.clear()
+    desired_render_chunks.clear()
+    desired_collider_chunks.clear()
+    desired_generation_chunks.clear()
+    last_player_chunk = None
 
     saved_chunks = save_data.get("chunks")
     if saved_chunks is not None:
@@ -791,6 +842,7 @@ def load_world():
 
     schedule_chunks_around_player(force=True)
     activate_chunk(chunk_coord_from_block((player.x, 0, player.z)), immediate=True)
+    world_initialized = True
     update_ui()
     set_status(f"Loaded {SAVE_FILE}")
     return True
@@ -826,10 +878,8 @@ def find_safe_spawn():
     return Vec3(best_x, best_y, best_z)
 
 
-generate_initial_world()
-
 player = FirstPersonController(
-    position=find_safe_spawn(),
+    position=(0, 15, 0),
     speed=NORMAL_SPEED,
     jump_height=1.5,
     gravity=0.7,
@@ -858,9 +908,6 @@ def input_player_controller(key):
 
 player.update = update_player_controller
 player.input = input_player_controller
-
-schedule_chunks_around_player(force=True)
-activate_chunk(chunk_coord_from_block((player.x, 0, player.z)), immediate=True)
 
 
 # ------------------------------------------------------------
@@ -1136,8 +1183,8 @@ help_text = create_label(
 coordinate_text = create_label(
     camera.ui,
     text="",
-    position=(0.68, 0.44),
-    scale=0.76,
+    position=(0.48, 0.44),
+    scale=0.62,
     color_value=UI_MUTED_TEXT,
 )
 
@@ -1520,55 +1567,70 @@ settings_backdrop = Entity(
 settings_panel = create_panel(
     settings_screen,
     position=(0, 0),
-    scale=(0.92, 0.84),
+    scale=(1.36, 0.88),
 )
 settings_title = create_label(
     settings_screen,
     text="SETTINGS",
-    position=(-0.39, 0.31),
+    position=(-0.62, 0.33),
     scale=1.55,
     color_value=UI_TEXT,
 )
 settings_tabs_panel = create_panel(
     settings_screen,
-    position=(-0.31, -0.015),
+    position=(-0.54, -0.015),
     scale=(0.22, 0.58),
 )
-settings_general_tab = create_framed_button(settings_screen, "GENERAL", (-0.31, 0.18), (0.17, 0.06))
-settings_video_tab = create_framed_button(settings_screen, "VIDEO", (-0.31, 0.09), (0.17, 0.06))
-settings_controls_tab = create_framed_button(settings_screen, "CONTROLS", (-0.31, 0.0), (0.17, 0.06))
-settings_about_tab = create_framed_button(settings_screen, "ABOUT", (-0.31, -0.09), (0.17, 0.06))
+settings_general_tab = create_framed_button(settings_screen, "GENERAL", (-0.54, 0.18), (0.17, 0.06))
+settings_video_tab = create_framed_button(settings_screen, "VIDEO", (-0.54, 0.09), (0.17, 0.06))
+settings_controls_tab = create_framed_button(settings_screen, "CONTROLS", (-0.54, 0.0), (0.17, 0.06))
+settings_about_tab = create_framed_button(settings_screen, "ABOUT", (-0.54, -0.09), (0.17, 0.06))
 settings_general_tab.frame.color = UI_SELECTED
 settings_category_hint = create_label(
     settings_screen,
     text="General settings are active.\nOther categories are visual guides\nfor future expansion.",
-    position=(-0.39, -0.19),
+    position=(-0.62, -0.19),
     scale=0.53,
     color_value=UI_MUTED_TEXT,
 )
 settings_sensitivity_label = create_label(
     settings_screen,
     text="",
-    position=(-0.13, 0.19),
-    scale=0.9,
+    position=(-0.40, 0.21),
+    scale=0.72,
     color_value=UI_TEXT,
 )
-sensitivity_down_button = create_framed_button(settings_screen, "-", (0.25, 0.19), (0.07, 0.06))
-sensitivity_up_button = create_framed_button(settings_screen, "+", (0.35, 0.19), (0.07, 0.06))
+sensitivity_down_button = create_framed_button(settings_screen, "-", (-0.05, 0.21), (0.06, 0.055))
+sensitivity_up_button = create_framed_button(settings_screen, "+", (0.03, 0.21), (0.06, 0.055))
 settings_render_label = create_label(
     settings_screen,
     text="",
-    position=(-0.13, 0.09),
-    scale=0.9,
+    position=(-0.40, 0.12),
+    scale=0.72,
     color_value=UI_TEXT,
 )
-render_down_button = create_framed_button(settings_screen, "-", (0.25, 0.09), (0.07, 0.06))
-render_up_button = create_framed_button(settings_screen, "+", (0.35, 0.09), (0.07, 0.06))
-fullscreen_label = create_label(settings_screen, "Fullscreen", (-0.13, -0.01), 0.9, UI_TEXT)
-fullscreen_button = create_framed_button(settings_screen, "", (0.30, -0.01), (0.17, 0.06))
-debug_label = create_label(settings_screen, "Debug Text", (-0.13, -0.11), 0.9, UI_TEXT)
-debug_button = create_framed_button(settings_screen, "", (0.30, -0.11), (0.17, 0.06))
-settings_back_button = create_framed_button(settings_screen, "<  BACK", (0.22, -0.30), (0.28, 0.07))
+render_down_button = create_framed_button(settings_screen, "-", (-0.05, 0.12), (0.06, 0.055))
+render_up_button = create_framed_button(settings_screen, "+", (0.03, 0.12), (0.06, 0.055))
+settings_collider_label = create_label(settings_screen, "", (-0.40, 0.03), 0.72, UI_TEXT)
+collider_down_button = create_framed_button(settings_screen, "-", (-0.05, 0.03), (0.06, 0.055))
+collider_up_button = create_framed_button(settings_screen, "+", (0.03, 0.03), (0.06, 0.055))
+fullscreen_label = create_label(settings_screen, "Fullscreen", (-0.40, -0.06), 0.72, UI_TEXT)
+fullscreen_button = create_framed_button(settings_screen, "", (-0.01, -0.06), (0.14, 0.055))
+debug_label = create_label(settings_screen, "Debug Text", (-0.40, -0.15), 0.72, UI_TEXT)
+debug_button = create_framed_button(settings_screen, "", (-0.01, -0.15), (0.14, 0.055))
+settings_budget_title = create_label(settings_screen, "CHUNK WORK BUDGETS", (0.15, 0.24), 0.72, UI_SELECTED)
+settings_generation_budget_label = create_label(settings_screen, "", (0.15, 0.15), 0.68, UI_TEXT)
+generation_budget_down_button = create_framed_button(settings_screen, "-", (0.52, 0.15), (0.06, 0.055))
+generation_budget_up_button = create_framed_button(settings_screen, "+", (0.60, 0.15), (0.06, 0.055))
+settings_rebuild_budget_label = create_label(settings_screen, "", (0.15, 0.06), 0.68, UI_TEXT)
+rebuild_budget_down_button = create_framed_button(settings_screen, "-", (0.52, 0.06), (0.06, 0.055))
+rebuild_budget_up_button = create_framed_button(settings_screen, "+", (0.60, 0.06), (0.06, 0.055))
+settings_unload_budget_label = create_label(settings_screen, "", (0.15, -0.03), 0.68, UI_TEXT)
+unload_budget_down_button = create_framed_button(settings_screen, "-", (0.52, -0.03), (0.06, 0.055))
+unload_budget_up_button = create_framed_button(settings_screen, "+", (0.60, -0.03), (0.06, 0.055))
+low_end_button = create_framed_button(settings_screen, "ENABLE LOW-END MODE", (0.37, -0.15), (0.43, 0.065))
+settings_feedback_label = create_label(settings_screen, "", (0.15, -0.22), 0.60, UI_SELECTED)
+settings_back_button = create_framed_button(settings_screen, "<  BACK", (0.37, -0.31), (0.28, 0.07))
 
 multiplayer_screen = Entity(parent=camera.ui, enabled=False)
 multiplayer_backdrop = Entity(
@@ -1659,13 +1721,31 @@ def show_main_menu():
     sync_gameplay_input_state()
 
 
+def initialize_world_for_singleplayer():
+    """Create or load world data only after Singleplayer is selected."""
+    global last_player_chunk, world_initialized
+
+    if world_initialized:
+        return
+
+    if os.path.exists(SAVE_FILE) and load_world():
+        return
+
+    generate_initial_world()
+    player.position = find_safe_spawn()
+    last_player_chunk = None
+    schedule_chunks_around_player(force=True)
+    activate_chunk(chunk_coord_from_block((player.x, 0, player.z)), immediate=True)
+    world_initialized = True
+
+
 def start_singleplayer():
     """Enter the generated or loaded world from the main menu."""
     global game_state
 
+    initialize_world_for_singleplayer()
     game_state = "playing"
     hide_menu_screens()
-    schedule_chunks_around_player(force=True)
     sync_gameplay_input_state()
     set_status("Singleplayer started. Press Esc to pause.")
 
@@ -1744,6 +1824,10 @@ def update_settings_labels():
     fullscreen_mode = "ON" if window.fullscreen else "OFF"
     settings_sensitivity_label.text = f"Mouse Sensitivity: {MOUSE_SENSITIVITY}"
     settings_render_label.text = f"Render Distance: {RENDER_DISTANCE} chunks"
+    settings_collider_label.text = f"Collider Distance: {COLLIDER_DISTANCE} chunks"
+    settings_generation_budget_label.text = f"Generate / frame: {MAX_CHUNK_GENERATIONS_PER_FRAME}"
+    settings_rebuild_budget_label.text = f"Rebuild / frame: {MAX_CHUNK_REBUILDS_PER_FRAME}"
+    settings_unload_budget_label.text = f"Unload / frame: {MAX_CHUNK_UNLOADS_PER_FRAME}"
     fullscreen_button.text = fullscreen_mode
     debug_button.text = debug_mode
 
@@ -1762,15 +1846,80 @@ def change_mouse_sensitivity(direction):
 
 def change_render_distance(direction):
     """Adjust render distance and refresh the streamed chunk target set."""
-    global RENDER_DISTANCE, GENERATION_DISTANCE
+    global RENDER_DISTANCE, COLLIDER_DISTANCE, GENERATION_DISTANCE
 
     RENDER_DISTANCE = max(
         MIN_RENDER_DISTANCE,
         min(MAX_RENDER_DISTANCE, RENDER_DISTANCE + direction),
     )
+    COLLIDER_DISTANCE = min(COLLIDER_DISTANCE, RENDER_DISTANCE)
     GENERATION_DISTANCE = RENDER_DISTANCE + 1
-    schedule_chunks_around_player(force=True)
+    if world_initialized:
+        schedule_chunks_around_player(force=True)
     update_settings_labels()
+
+
+def change_collider_distance(direction):
+    """Adjust how many rendered chunks retain mesh colliders."""
+    global COLLIDER_DISTANCE
+
+    COLLIDER_DISTANCE = max(
+        MIN_COLLIDER_DISTANCE,
+        min(RENDER_DISTANCE, COLLIDER_DISTANCE + direction),
+    )
+    if world_initialized:
+        schedule_chunks_around_player(force=True)
+    update_settings_labels()
+
+
+def change_chunk_budget(setting_name, direction):
+    """Adjust one live per-frame chunk work limit within conservative bounds."""
+    global MAX_CHUNK_GENERATIONS_PER_FRAME
+    global MAX_CHUNK_REBUILDS_PER_FRAME
+    global MAX_CHUNK_UNLOADS_PER_FRAME
+
+    if setting_name == "generation":
+        MAX_CHUNK_GENERATIONS_PER_FRAME = max(
+            MIN_CHUNK_GENERATIONS_PER_FRAME,
+            min(MAX_CHUNK_GENERATIONS_SETTING, MAX_CHUNK_GENERATIONS_PER_FRAME + direction),
+        )
+    elif setting_name == "rebuild":
+        MAX_CHUNK_REBUILDS_PER_FRAME = max(
+            MIN_CHUNK_REBUILDS_PER_FRAME,
+            min(MAX_CHUNK_REBUILDS_SETTING, MAX_CHUNK_REBUILDS_PER_FRAME + direction),
+        )
+    elif setting_name == "unload":
+        MAX_CHUNK_UNLOADS_PER_FRAME = max(
+            MIN_CHUNK_UNLOADS_PER_FRAME,
+            min(MAX_CHUNK_UNLOADS_SETTING, MAX_CHUNK_UNLOADS_PER_FRAME + direction),
+        )
+
+    update_settings_labels()
+
+
+def enable_low_end_mode():
+    """Apply a conservative preset for less powerful computers."""
+    global RENDER_DISTANCE, COLLIDER_DISTANCE, GENERATION_DISTANCE
+    global MAX_CHUNK_GENERATIONS_PER_FRAME
+    global MAX_CHUNK_REBUILDS_PER_FRAME
+    global MAX_CHUNK_UNLOADS_PER_FRAME
+    global debug_text_enabled
+
+    RENDER_DISTANCE = 1
+    COLLIDER_DISTANCE = 1
+    GENERATION_DISTANCE = RENDER_DISTANCE + 1
+    MAX_CHUNK_GENERATIONS_PER_FRAME = 1
+    MAX_CHUNK_REBUILDS_PER_FRAME = 1
+    MAX_CHUNK_UNLOADS_PER_FRAME = 2
+    debug_text_enabled = False
+    settings_feedback_label.text = "Low-End Mode enabled."
+
+    if world_initialized:
+        schedule_chunks_around_player(force=True)
+
+    update_settings_labels()
+    sync_gameplay_input_state()
+    set_status("Low-End Mode enabled.")
 
 
 def toggle_fullscreen():
@@ -1801,6 +1950,15 @@ sensitivity_down_button.on_click = Func(change_mouse_sensitivity, -1)
 sensitivity_up_button.on_click = Func(change_mouse_sensitivity, 1)
 render_down_button.on_click = Func(change_render_distance, -1)
 render_up_button.on_click = Func(change_render_distance, 1)
+collider_down_button.on_click = Func(change_collider_distance, -1)
+collider_up_button.on_click = Func(change_collider_distance, 1)
+generation_budget_down_button.on_click = Func(change_chunk_budget, "generation", -1)
+generation_budget_up_button.on_click = Func(change_chunk_budget, "generation", 1)
+rebuild_budget_down_button.on_click = Func(change_chunk_budget, "rebuild", -1)
+rebuild_budget_up_button.on_click = Func(change_chunk_budget, "rebuild", 1)
+unload_budget_down_button.on_click = Func(change_chunk_budget, "unload", -1)
+unload_budget_up_button.on_click = Func(change_chunk_budget, "unload", 1)
+low_end_button.on_click = enable_low_end_mode
 fullscreen_button.on_click = toggle_fullscreen
 debug_button.on_click = toggle_debug_text
 settings_back_button.on_click = return_from_settings
@@ -1839,7 +1997,17 @@ def update_ui():
     """Refresh hotbar, inventory, crafting, health, and hunger UI."""
     current_block = BLOCK_ORDER[selected_index]
     selected_text.text = f"Selected: {current_block.title()} x{inventory.get(current_block, 0)}"
-    coordinate_text.text = f"XYZ: {int(player.x)}, {int(player.y)}, {int(player.z)}"
+    active_collider_chunks = sum(
+        1
+        for chunk_coord, collider_enabled in chunk_collider_states.items()
+        if collider_enabled and chunk_coord in chunks and chunks[chunk_coord]
+    )
+    coordinate_text.text = (
+        f"XYZ: {int(player.x)}, {int(player.y)}, {int(player.z)}\n"
+        f"Chunks: {len(chunks)} rendered | {active_collider_chunks} colliders\n"
+        f"Queued: {len(chunk_generation_queue)} generation | {len(dirty_chunks)} rebuilds\n"
+        f"Distance: {RENDER_DISTANCE} render | {COLLIDER_DISTANCE} collider"
+    )
 
     filled_health_icons = int(math.ceil(max(0.0, min(100.0, health)) / 10))
     filled_hunger_icons = int(math.ceil(max(0.0, min(100.0, hunger)) / 10))
@@ -2196,11 +2364,6 @@ def update():
 
 update_ui()
 update_settings_labels()
-
-# Auto-load existing save if available.
-# Delete voxel_world_save.json if you want a fresh world.
-if os.path.exists(SAVE_FILE):
-    load_world()
 
 show_main_menu()
 app.run()

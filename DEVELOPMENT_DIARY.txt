@@ -863,6 +863,60 @@ components rather than repeated values. Presentation work can remain focused
 and low-risk when it respects the existing gameplay boundaries.
 
 
+2 June 2026 - Collider Distance and Low-End Performance Controls
+---------------------------------------------------------------
+
+What changed:
+I separated chunk visibility from chunk collision distance. The game can now
+keep terrain meshes visible across the selected render distance while only
+building mesh colliders for nearby chunks. Collider distance is clamped so it
+cannot exceed render distance, and collider changes are applied through the
+existing dirty-chunk rebuild queue as the player moves.
+
+I also expanded the settings screen with live controls for collider distance
+and the per-frame generation, mesh rebuild, and unload budgets. A Low-End Mode
+preset applies conservative values, disables FPS and debug overlays, and keeps
+the nearby collision area active. The debug overlay now reports player
+coordinates, rendered chunks, collider chunks, queued generation work, dirty
+mesh rebuilds, and the active render and collider distances.
+
+Finally, I deferred world generation and save loading until Singleplayer is
+selected. The launch menu can appear without first generating terrain. Pending
+generation requests are also reprioritised whenever the streamed area changes,
+so old requests do not delay chunks near the player's current position.
+
+Why the change was needed:
+Combined meshes solved the original cost of creating one Entity per block, but
+the next bottleneck was more specific: every visible chunk mesh still carried
+a physics collider. Distant terrain needs to be drawn, but it does not need to
+participate in movement, ceiling checks, or block interaction raycasts. Large
+amounts of queued generation work could also make nearby streaming feel less
+responsive after moving between areas.
+
+Technical challenge:
+Collision had to remain reliable for walking, jumping beneath trees, mining,
+placing blocks, and the targeted-block outline. At the same time, adding or
+removing distant colliders could not introduce a new frame spike. The settings
+also needed to work before a world had been created because they are available
+from the main menu.
+
+Solution:
+Each chunk rebuild now decides whether its combined opaque and transparent
+meshes receive colliders based on the nearby collider target set. Changes are
+queued gradually through the dirty chunk system, while the player's current
+chunk is refreshed immediately when needed for safety. Live settings refresh
+streaming targets only when a world exists, which keeps the menu lightweight.
+The deterministic terrain rules, reduced tree density, in-memory block data,
+and chunk-based save format remain unchanged.
+
+What I learned:
+Rendering distance and physics distance are separate performance decisions.
+Profiling a voxel prototype means looking beyond visible geometry and checking
+the secondary costs attached to that geometry, including colliders, queues,
+and startup work. Small bounded budgets make performance easier to tune for
+different computers without weakening world correctness.
+
+
 ============================================================
 END OF DEVELOPMENT DIARY
 ============================================================
