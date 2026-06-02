@@ -48,7 +48,11 @@ TREE_MIN_SPACING = 5
 NORMAL_SPEED = 5.5
 SPRINT_SPEED = 9.0
 REACH_DISTANCE = 6
-CEILING_COLLISION_MARGIN = 0.02
+PLAYER_HEIGHT = 1.8
+PLAYER_EYE_HEIGHT = 1.62
+PLAYER_RADIUS = 0.35
+PLAYER_FEET_CLEARANCE = 0.08
+PLAYER_HEAD_CLEARANCE = 0.04
 
 DAY_LENGTH_SECONDS = 90.0
 UI_REFRESH_SECONDS = 0.1
@@ -885,6 +889,10 @@ player = FirstPersonController(
     gravity=0.7,
 )
 
+player.height = PLAYER_HEIGHT
+if hasattr(player, "camera_pivot"):
+    player.camera_pivot.y = PLAYER_EYE_HEIGHT
+
 player.cursor.visible = False
 player.mouse_sensitivity = Vec2(MOUSE_SENSITIVITY, MOUSE_SENSITIVITY)
 mouse.locked = False
@@ -898,6 +906,8 @@ def update_player_controller():
     """Run first-person movement only while gameplay input is active."""
     if game_state == "playing" and not inventory_open:
         player_controller_update()
+        resolve_player_ceiling_collision()
+        update_held_space_jump()
 
 
 def input_player_controller(key):
@@ -2134,6 +2144,82 @@ def break_block():
         update_ui()
 
 
+def would_block_intersect_player(coord):
+    """Return whether a voxel would overlap the player's usable body space."""
+    block_min_x = coord[0] - 0.5
+    block_max_x = coord[0] + 0.5
+    block_min_y = coord[1] - 0.5
+    block_max_y = coord[1] + 0.5
+    block_min_z = coord[2] - 0.5
+    block_max_z = coord[2] + 0.5
+
+    player_min_x = player.x - PLAYER_RADIUS
+    player_max_x = player.x + PLAYER_RADIUS
+    player_min_y = player.y + PLAYER_FEET_CLEARANCE
+    player_max_y = player.y + PLAYER_HEIGHT - PLAYER_HEAD_CLEARANCE
+    player_min_z = player.z - PLAYER_RADIUS
+    player_max_z = player.z + PLAYER_RADIUS
+
+    return (
+        block_max_x > player_min_x
+        and block_min_x < player_max_x
+        and block_max_y > player_min_y
+        and block_min_y < player_max_y
+        and block_max_z > player_min_z
+        and block_min_z < player_max_z
+    )
+
+
+def get_block_below_player_coord():
+    """Return the highest voxel coordinate that fits immediately below the feet."""
+    return (
+        int(math.floor(player.x + 0.5)),
+        int(math.floor(player.y + PLAYER_FEET_CLEARANCE - 0.5)),
+        int(math.floor(player.z + 0.5)),
+    )
+
+
+def has_neighboring_support(coord):
+    """Return whether a new voxel can attach to an existing neighboring block."""
+    x, y, z = coord
+    return any(
+        (x + dx, y + dy, z + dz) in world_data
+        for dx, dy, dz in NEIGHBOR_OFFSETS
+    )
+
+
+def place_selected_block_at(coord, block_type):
+    """Add one selected voxel through the chunk dirtying flow."""
+    if coord in world_data or would_block_intersect_player(coord):
+        return False
+
+    if not add_block(coord, block_type, create_entity=True):
+        return False
+
+    inventory[block_type] -= 1
+    set_status(f"Placed {block_type}.")
+    update_ui()
+    return True
+
+
+def place_block_under_player(block_type):
+    """Place a supported voxel beneath an airborne player looking downward."""
+    if player.grounded and not getattr(player, "jumping", False):
+        return False
+
+    if camera.forward.y > -0.35:
+        return False
+
+    coord = get_block_below_player_coord()
+    if coord in world_data or would_block_intersect_player(coord):
+        return False
+
+    if not has_neighboring_support(coord):
+        return False
+
+    return place_selected_block_at(coord, block_type)
+
+
 def place_block():
     """Place the selected block against the block currently looked at."""
     current_block = BLOCK_ORDER[selected_index]
@@ -2145,26 +2231,21 @@ def place_block():
     hit = raycast_chunk_mesh()
 
     if hit is None:
+        place_block_under_player(current_block)
         return
 
     coord = block_coord_from_hit(hit, place_against_face=True)
 
-    # Do not place inside the player's body.
-    inside_player_x = abs(coord[0] - player.x) < 0.8
-    inside_player_y = player.y - 1.0 < coord[1] < player.y + 1.8
-    inside_player_z = abs(coord[2] - player.z) < 0.8
-
-    if inside_player_x and inside_player_y and inside_player_z:
-        set_status("Can't place inside yourself.")
-        return
-
     if coord in world_data:
+        place_block_under_player(current_block)
         return
 
-    if add_block(coord, current_block, create_entity=True):
-        inventory[current_block] -= 1
-        set_status(f"Placed {current_block}.")
-        update_ui()
+    if would_block_intersect_player(coord):
+        if not place_block_under_player(current_block):
+            set_status("Can't place inside yourself.")
+        return
+
+    place_selected_block_at(coord, current_block)
 
 
 # ------------------------------------------------------------
@@ -2301,12 +2382,12 @@ def update_status_message():
             status_text.text = ""
 
 
-def resolve_player_ceiling_collision():
-    """Stop jump animation when the player's head reaches an overhead block."""
+def raycast_player_ceiling(distance):
+    """Return a downward-facing ceiling hit above the player's feet."""
     hit = raycast(
-        player.world_position + Vec3(0, 0.05, 0),
+        player.world_position + Vec3(0, PLAYER_FEET_CLEARANCE, 0),
         Vec3(0, 1, 0),
-        distance=player.height + CEILING_COLLISION_MARGIN + 0.05,
+        distance=distance,
         traverse_target=player.traverse_target,
         ignore=player.ignore_list,
     )
@@ -2316,9 +2397,20 @@ def resolve_player_ceiling_collision():
         or not getattr(hit.entity, "is_chunk_mesh", False)
         or hit.world_normal.y > -0.7
     ):
+        return None
+
+    return hit
+
+
+def resolve_player_ceiling_collision():
+    """Stop jump animation when the player's head reaches an overhead block."""
+    hit = raycast_player_ceiling(
+        PLAYER_HEIGHT - PLAYER_FEET_CLEARANCE + PLAYER_HEAD_CLEARANCE
+    )
+    if hit is None:
         return
 
-    max_player_y = hit.world_point.y - player.height - CEILING_COLLISION_MARGIN
+    max_player_y = hit.world_point.y - PLAYER_HEIGHT - PLAYER_HEAD_CLEARANCE
     if player.y < max_player_y:
         return
 
@@ -2331,6 +2423,52 @@ def resolve_player_ceiling_collision():
     player.air_time = max(player.air_time, 0.05)
 
 
+def jump_player_with_ceiling_limit():
+    """Start a jump whose animation target cannot pass through a ceiling."""
+    if not player.grounded:
+        return
+
+    target_y = player.y + player.jump_height
+    hit = raycast_player_ceiling(
+        PLAYER_HEIGHT
+        - PLAYER_FEET_CLEARANCE
+        + PLAYER_HEAD_CLEARANCE
+        + player.jump_height
+    )
+    if hit is not None:
+        target_y = min(
+            target_y,
+            hit.world_point.y - PLAYER_HEIGHT - PLAYER_HEAD_CLEARANCE,
+        )
+
+    if target_y <= player.y + 0.01:
+        return
+
+    player.grounded = False
+    player.jumping = True
+    player.animate_y(
+        target_y,
+        player.jump_up_duration,
+        resolution=max(1, int(1 // max(time.dt, 1 / 240))),
+        curve=curve.out_expo,
+    )
+    invoke(player.start_fall, delay=player.fall_after)
+
+
+def update_held_space_jump():
+    """Repeat jumps while Space is held, but only after each grounded landing."""
+    if (
+        is_gameplay_input_active()
+        and held_keys["space"]
+        and player.grounded
+        and hasattr(player, "jump")
+    ):
+        player.jump()
+
+
+player.jump = jump_player_with_ceiling_limit
+
+
 def update():
     """Main update loop called every frame."""
     global chunk_stream_update_timer, ui_update_timer
@@ -2341,7 +2479,6 @@ def update():
 
     if game_state == "playing":
         player.speed = SPRINT_SPEED if held_keys["left shift"] else NORMAL_SPEED
-        resolve_player_ceiling_collision()
         update_survival_stats()
 
         chunk_stream_update_timer -= time.dt

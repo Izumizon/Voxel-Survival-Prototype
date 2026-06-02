@@ -917,6 +917,86 @@ and startup work. Small bounded budgets make performance easier to tune for
 different computers without weakening world correctness.
 
 
+2 June 2026 - Voxel-Scale Player Movement and Tower Building
+------------------------------------------------------------
+
+What changed:
+I aligned the first-person controller with explicit voxel-scale player
+dimensions. The player now uses a height of 1.8 blocks, a 1.62-block eye
+height, a defined horizontal radius, and small feet and head clearances. I
+also added continuous held-space jumping: holding Space requests another jump
+only after the player has landed, rather than allowing unrestricted upward
+movement.
+
+Block placement now supports tower building. While airborne and looking
+downward, the player can place a supported block directly beneath their feet.
+Normal right-click placement against visible voxel faces remains the default
+behaviour.
+
+Why the change was needed:
+The previous controller used Ursina's default camera pivot height while other
+parts of the prototype assumed slightly different body dimensions. That could
+make the camera clip into ceilings in low tunnels. The original block
+placement safety check also used broad hard-coded ranges, which prevented
+legitimate placement beneath the player while jumping.
+
+Technical challenge:
+The movement fix needed to preserve reliable ceiling collision without making
+two-block-high tunnels impassable. Tower placement also needed to distinguish
+between a valid block immediately beneath the feet and an invalid block inside
+the torso or head. It had to continue using the chunk dirtying flow rather
+than introducing individual block entities or rebuilding the full world.
+
+Solution:
+I set the controller height and camera pivot explicitly after creating the
+FirstPersonController. The ceiling raycast now uses the same shared player
+height and head-clearance values. Placement uses a reusable body-overlap
+helper based on a simple player bounding volume, plus a carefully rounded
+below-feet coordinate and a neighboring-support check. Successful tower blocks
+go through the existing add-block path, so chunk updates remain local and
+gradual.
+
+What I learned:
+Small inconsistencies between controller height, eye position, collision
+clearance, and placement rules can noticeably affect how a voxel game feels.
+Defining those dimensions once and reusing them makes movement and building
+behaviour easier to reason about and tune.
+
+
+2 June 2026 - Jump Timing and Ceiling Collision Refinement
+----------------------------------------------------------
+
+What changed:
+I refined the held-space jump and overhead collision behaviour after gameplay
+testing. Continuous jumping is now checked immediately after Ursina's
+FirstPersonController updates its grounded state. Jump launches also calculate
+a ceiling-limited animation target before upward movement begins.
+
+Why the change was needed:
+The first held-space implementation ran from the general game loop, which
+could execute before the controller reported a new landing. Overhead collision
+was corrected after upward movement, leaving a brief visual clipping frame
+when jumping beneath a block.
+
+Technical challenge:
+The fix needed to preserve Ursina's normal movement and gravity handling while
+changing the timing of two small but important decisions. A ceiling check also
+had to avoid introducing a second movement system or bypassing the chunk mesh
+colliders.
+
+Solution:
+I kept the existing controller update and added a narrow post-update step for
+ceiling correction and held-space jump retries. The jump method now raycasts
+against the same nearby chunk mesh colliders and clamps its animated target to
+the available headroom. This prevents overshoot instead of relying solely on
+correction after contact.
+
+What I learned:
+In a real-time controller, update order matters as much as collision geometry.
+Preventing invalid motion before an animation starts produces a cleaner result
+than correcting the player's position one frame later.
+
+
 ============================================================
 END OF DEVELOPMENT DIARY
 ============================================================
