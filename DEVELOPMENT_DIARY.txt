@@ -1,0 +1,868 @@
+VOXEL SURVIVAL PROTOTYPE
+DEVELOPMENT DIARY
+
+Project: Minecraft-Inspired Voxel Survival Game
+Technology: Python and Ursina Engine
+Last updated: 1 June 2026
+
+
+============================================================
+1. PROJECT OVERVIEW
+============================================================
+
+Voxel Survival Prototype is an original educational game project built with
+Python and Ursina Engine. It is inspired by the core ideas behind Minecraft,
+particularly voxel terrain, exploration, mining, block placement, and simple
+survival systems. It is not intended to reproduce Minecraft or use copied
+Minecraft content.
+
+I built the project to improve my understanding of how an interactive 3D game
+can be structured in Python. The project began as a compact voxel prototype and
+gradually developed into a more complete survival sandbox with procedural
+terrain, streamed chunks, inventory management, crafting recipes, survival
+statistics, and JSON save files.
+
+The game deliberately uses simple coloured blocks rather than paid assets or
+copied Minecraft textures. This keeps the focus on programming, architecture,
+debugging, and optimisation. It also makes the project self-contained and
+suitable for sharing publicly in a portfolio repository.
+
+The strongest part of the project is the iteration process. Several early
+approaches worked functionally but performed poorly as the world became more
+complex. I used profiling observations, runtime logs, and visual testing to
+replace those approaches with chunk-based systems that are more appropriate for
+a voxel game.
+
+
+============================================================
+2. DEVELOPMENT GOALS
+============================================================
+
+My goal was to create a playable first-person voxel survival prototype while
+learning how the main systems fit together. The project needed to be simple
+enough to understand clearly, but complete enough to demonstrate meaningful
+technical decisions.
+
+The main goals were:
+
+- Implement first-person movement with mouse look, walking, sprinting, jumping,
+  gravity, and collision handling.
+- Generate a voxel world procedurally rather than building a fixed map by hand.
+- Allow the player to break blocks with the left mouse button and place selected
+  blocks with the right mouse button.
+- Store the world as block coordinates and block types so edits remain easy to
+  reason about.
+- Add a hotbar-style inventory with multiple block types.
+- Include a small crafting system with recipes for glass, wood, and stone.
+- Add survival mechanics, including health, hunger, starvation, regeneration,
+  respawning, and fall recovery.
+- Include a basic day and night cycle using sky and lighting changes.
+- Save and load the edited world, inventory, selected item, player statistics,
+  generated chunks, and player position using JSON.
+- Optimise rendering so the game does not create one expensive scene object for
+  every voxel.
+- Stream nearby chunks gradually as the player explores while unloading distant
+  chunk meshes without losing block edits.
+
+
+============================================================
+3. TECHNICAL APPROACH
+============================================================
+
+Python and Ursina Engine
+------------------------
+
+The project is written in Python and uses Ursina Engine for the application
+window, entities, camera, UI, lighting, input handling, raycasting, and the
+first-person controller. Ursina made it possible to prototype quickly while
+still exposing enough lower-level behaviour to learn about 3D rendering and
+collision handling.
+
+World Data
+----------
+
+The world is stored in a dictionary called world_data. Each key is a coordinate
+tuple in the form:
+
+    (x, y, z)
+
+The associated value is a block type such as:
+
+    "grass", "dirt", "stone", "sand", "wood", "leaves", "water", "glass"
+
+This dictionary remains the source of truth for the game world. Rendering is
+treated as a visual representation of that data rather than the data itself.
+This separation is important because chunk meshes can be destroyed when they
+move outside the render distance while the actual block changes remain stored
+in memory.
+
+Procedural Terrain Generation
+-----------------------------
+
+Terrain height is generated using deterministic value noise and fractal
+Brownian motion. The same seed and coordinates always produce the same terrain.
+This means that chunks can be generated when needed without relying on an
+external terrain file.
+
+The generator creates terrain columns with stone, dirt, and surface blocks. It
+adds sand near water, fills shallow areas with water, and places simple trees in
+appropriate locations. Tree generation is also deterministic.
+
+Chunk-Based Rendering
+---------------------
+
+The world is divided horizontally using X and Z coordinates. Each chunk is
+currently 16 by 16 blocks wide. The game keeps several related structures:
+
+- world_data stores all known blocks.
+- chunk_blocks indexes the block coordinates belonging to each chunk.
+- chunks stores only currently active chunk mesh entities.
+- dirty_chunks tracks active chunks that need their meshes rebuilt.
+- generated_chunks records chunks that have already been procedurally generated.
+
+Each active chunk builds a combined mesh instead of creating an Ursina Entity
+for every block. The mesh includes only visible block faces. For example, if two
+solid blocks touch each other, neither of the hidden faces between them is sent
+to the renderer.
+
+Opaque blocks and transparent blocks are built into separate chunk meshes. This
+keeps grass, dirt, stone, sand, and wood separate from leaves, water, and glass.
+The current prototype still uses simple colours, but the structure leaves room
+for future material or texture improvements.
+
+Chunk Streaming
+---------------
+
+Chunks are loaded around the player within a render distance. Chunks beyond
+that distance have their mesh entities destroyed, reducing the number of active
+rendered objects and colliders.
+
+Importantly, unloading is visual only. The game does not delete the underlying
+blocks from world_data. If the player breaks a block, walks away, and later
+returns, the edit remains in memory.
+
+Generation, mesh rebuilding, and unloading are processed gradually. The game
+limits the amount of chunk work completed during a single frame to reduce
+visible pauses during exploration.
+
+Breaking and Placing Blocks
+---------------------------
+
+Chunk meshes use mesh colliders so they can still be targeted accurately.
+Raycasts return a hit point and face normal from the combined mesh.
+
+To break a block, the game samples a point slightly inside the clicked face and
+converts that world position back into an integer block coordinate.
+
+To place a block, the game samples a point slightly outside the clicked face.
+This produces the neighbouring coordinate where the new block should be added.
+
+After an edit, only the affected chunk is marked dirty. If the edited block is
+on a chunk border, the relevant neighbouring chunk is also marked dirty because
+its visible faces may have changed.
+
+Save and Load System
+--------------------
+
+The save system uses JSON. It stores:
+
+- The complete known world block dictionary.
+- The generated chunk coordinates.
+- Inventory quantities.
+- The selected hotbar index.
+- Health and hunger.
+- Player position.
+
+This approach is readable and easy to inspect during development. It is
+appropriate for the current prototype, although a larger world would benefit
+from a more compact chunk-oriented file format.
+
+
+============================================================
+4. CHALLENGES AND SOLUTIONS
+============================================================
+
+Challenge: The initial game window appeared white
+-------------------------------------------------
+
+The first visible issue was a white game screen. The application loop was
+running, but the scene colours were not displayed correctly.
+
+The cause was a mismatch between the expected colour range and the values used
+by the installed Ursina version. The code passed familiar 0-255 RGB values, but
+the Ursina colour API expected values in the 0.0-1.0 range. Most channels were
+therefore clamped and displayed as white.
+
+I added helper functions that convert 0-255 RGB and RGBA values into Ursina's
+expected range. This kept the colour definitions readable while fixing the
+rendered output and transparency values.
+
+Challenge: One Entity per block caused poor performance
+-------------------------------------------------------
+
+The early renderer created a separate cube entity and collider for every
+visible block. Even after buried blocks were excluded, the number of scene
+objects remained too high. Startup was slow and frame rate suffered.
+
+The solution was to generate combined meshes from visible block faces. This
+removed hidden faces between connected blocks and reduced the number of active
+entities and colliders dramatically.
+
+Challenge: Breaking or placing a block caused stutter
+-----------------------------------------------------
+
+After combined meshes were introduced, edits still rebuilt the entire visible
+world synchronously. This caused noticeable pauses whenever the player mined or
+placed a block.
+
+I split the world into chunks and introduced a dirty chunk queue. Block edits
+now queue only the relevant chunk for rebuilding. Chunks across an edited border
+are also queued because their visible faces may change. The number of chunk
+meshes rebuilt in one frame is limited, preventing large spikes in work.
+
+Challenge: Exploring required a scalable world structure
+---------------------------------------------------------
+
+A fixed world was suitable for an early prototype but did not demonstrate how
+a voxel game should manage exploration. Rendering every known chunk would also
+become expensive over time.
+
+I added streamed chunk loading. Nearby chunks are generated and activated
+gradually as the player walks. Distant chunk meshes are destroyed, but their
+block data remains stored in memory. The game therefore saves processing and
+rendering work without forgetting player edits.
+
+Challenge: Combined mesh raycasting still needed accurate edits
+---------------------------------------------------------------
+
+Once individual block entities were removed, a raycast could no longer read a
+block type directly from the hit entity. A chunk mesh represents many blocks.
+
+I preserved accurate breaking and placement by converting the hit point and face
+normal back into a voxel coordinate. The mesh entities also carry explicit
+metadata so interaction raycasts only accept valid chunk colliders.
+
+Challenge: Jumping could place the player inside tree blocks
+------------------------------------------------------------
+
+The Ursina first-person controller includes downward and sideways collision
+checks, but its jump is implemented as an upward animation. It did not
+automatically cancel the jump when the player's head reached a block above.
+
+I added an upward head-clearance raycast. When the player reaches the underside
+of an overhead chunk mesh face, the game snaps the player below the block,
+pauses the upward animation, and begins falling normally.
+
+Challenge: Keeping UI work lightweight
+--------------------------------------
+
+The early update loop rewrote the hotbar UI every rendered frame. That was
+unnecessary because most values change slowly.
+
+I changed the interface refresh to run at a controlled interval while still
+updating immediately when an inventory or selection action occurs.
+
+
+============================================================
+5. FEATURES IMPLEMENTED
+============================================================
+
+First-Person Controls
+---------------------
+
+- WASD movement.
+- Mouse look.
+- Jumping with gravity.
+- Sprinting with Left Shift.
+- Side collision handling from Ursina's controller.
+- Additional ceiling collision handling for overhead blocks.
+- Respawning after falling below the world or reaching zero health.
+
+Procedural Voxel World
+----------------------
+
+- Deterministic terrain generated from a fixed seed.
+- Stone, dirt, grass, and sand terrain layers.
+- Water filling in shallow areas.
+- Procedurally placed trees with trunks and leaf canopies.
+- Streamed chunk generation around the player.
+- Distant visual chunk unloading while preserving world edits in memory.
+
+Voxel Rendering
+---------------
+
+- Chunk-based combined meshes.
+- Visible-face-only mesh generation.
+- Hidden faces between adjacent solid blocks are excluded.
+- Separate opaque and transparent meshes.
+- Mesh colliders for interaction and movement.
+- Gradual dirty chunk rebuilding.
+
+Building and Mining
+-------------------
+
+- Left-click block breaking.
+- Right-click block placement.
+- Accurate coordinate recovery from combined chunk mesh raycasts.
+- Inventory updates after mining and placement.
+- Prevention of placing blocks inside the player's body.
+
+Inventory and Crafting
+----------------------
+
+- Eight selectable hotbar block types.
+- Inventory quantities displayed in the HUD.
+- Number keys 1-8 select blocks.
+- An inventory overlay opens with E and displays block names and quantities.
+- Inventory slots can be clicked to update the selected hotbar block.
+- Opening the inventory releases the mouse and pauses first-person control.
+- Glass recipe: two sand and one stone produce two glass blocks.
+- Wood recipe: four leaves produce one wood block.
+- Stone recipe: four dirt blocks produce one stone block.
+
+Survival and Presentation
+-------------------------
+
+- Health and hunger bars.
+- Hunger depletion over time.
+- Faster hunger depletion while sprinting.
+- Starvation damage.
+- Slow regeneration while well fed.
+- Day and night colour changes using sky, ambient light, and directional light.
+- On-screen controls and status messages.
+
+Saving and Loading
+------------------
+
+- F5 saves the world to JSON.
+- F9 loads the JSON save.
+- Block data is grouped by chunk in the JSON save format.
+- The save includes known blocks, generated chunks, inventory, selection,
+  player statistics, and player position.
+
+
+============================================================
+6. WHAT I LEARNED
+============================================================
+
+Game Loops
+----------
+
+I learned that small amounts of unnecessary work can become expensive when they
+happen every frame. UI refreshes, chunk generation, and mesh rebuilding all need
+to be scheduled deliberately. A stable game loop is not only about correct
+behaviour; it is also about controlling when work happens.
+
+Rendering Optimisation
+----------------------
+
+The largest improvement came from separating world data from rendering. A voxel
+world should not automatically imply one scene object per block. Combined
+meshes, visible-face generation, and chunk-level updates are much more suitable.
+
+I also learned that optimisation often changes architecture. The performance
+problem could not be solved with a small tweak alone. It required replacing the
+representation used by the renderer.
+
+Procedural Generation
+---------------------
+
+Deterministic noise is useful because it allows terrain to be generated at any
+coordinate when needed. The same seed gives consistent results, which makes
+debugging and chunk streaming easier.
+
+Collision and Raycasting
+------------------------
+
+Combined meshes require a different approach to interaction. Instead of relying
+on an individual block entity, the game must interpret the hit location and
+normal. I also learned that a built-in controller may cover common cases without
+covering every case required by a voxel world, such as hitting a head on an
+overhead block during an animated jump.
+
+UI Design
+---------
+
+The user interface does not need to be visually complex to be useful. A clear
+hotbar, status message, health bar, hunger bar, and visible controls make the
+prototype understandable. Updating UI data only when needed also improves
+efficiency.
+
+Managing a Growing Python Project
+---------------------------------
+
+As the file grew, keeping responsibilities separated became more important. The
+project now has clear groups for terrain generation, chunk rendering, saving,
+UI, crafting, interaction, and frame updates. Future development would benefit
+from splitting these systems into modules, but the current structure remains
+readable for a single-file prototype.
+
+Debugging Performance Problems
+------------------------------
+
+I learned to distinguish between a rendering bug, a startup delay, and a
+performance architecture problem. Runtime logs confirmed whether the application
+loop started correctly. Visual captures revealed scene colour and camera issues.
+Entity and collider counts helped verify that mesh batching produced a genuine
+improvement rather than only changing the code structure.
+
+
+============================================================
+7. FUTURE IMPROVEMENTS
+============================================================
+
+The prototype is playable, but there are several realistic directions for
+future development:
+
+- Add cave generation and underground variation.
+- Add additional biomes with distinct terrain rules.
+- Add tools with mining speed, durability, and appropriate block interactions.
+- Expand crafting into a recipe interface rather than keyboard shortcuts.
+- Add mobs and basic artificial intelligence.
+- Add damage sources beyond starvation and falling below the world.
+- Add sound effects for footsteps, mining, placement, crafting, and ambience.
+- Add optional texture support while keeping original or properly licensed
+  assets.
+- Improve transparent block rendering for water and glass.
+- Add a main menu, pause menu, and settings screen.
+- Add configurable render distance and control sensitivity.
+- Split the Python code into modules for easier maintenance.
+- Store save data in a more compact chunk-oriented format for larger worlds.
+- Add automated tests for coordinate conversion, deterministic generation,
+  chunk borders, save loading, and inventory recipes.
+
+
+============================================================
+8. PORTFOLIO REFLECTION
+============================================================
+
+This project is useful for my portfolio because it demonstrates more than a
+small scripted demo. It shows that I can build an interactive system, identify
+technical limitations, investigate runtime behaviour, and revise the
+architecture when the original approach does not scale.
+
+The project demonstrates:
+
+- Practical Python programming.
+- Familiarity with a real-time game engine.
+- Understanding of dictionaries, queues, coordinate systems, and JSON data.
+- Procedural content generation.
+- 3D mesh generation and face culling.
+- Raycasting and collision handling.
+- Performance awareness.
+- UI and gameplay state management.
+- A willingness to debug, measure, and iterate.
+
+The current game is intentionally an educational prototype rather than a
+commercial product. That makes the development process especially important.
+The value of the project is not only the final feature list, but also the way
+the code evolved from a simple voxel experiment into a more structured,
+streamed chunk system.
+
+
+============================================================
+9. DEVELOPMENT MILESTONES
+============================================================
+
+1 June 2026 - Initial Playable Survival Prototype
+-------------------------------------------------
+
+What changed:
+I assembled the initial playable version using Python and Ursina Engine. It
+included first-person movement, procedural terrain, coloured voxel blocks,
+trees, water, block breaking and placement, an eight-slot inventory, simple
+crafting, health, hunger, day and night lighting, and JSON save/load support.
+
+Why the change was needed:
+The goal was to establish a complete gameplay loop before focusing on deeper
+optimisation. A playable baseline made it possible to test how the individual
+systems interacted.
+
+Technical challenge:
+The prototype needed to remain self-contained without relying on external
+textures or asset packs.
+
+Solution:
+I used simple coloured blocks and deterministic terrain generation. This kept
+the project focused on code while still producing a clear voxel environment.
+
+What I learned:
+A complete baseline is valuable even when it is not yet optimised. It provides
+a reference point for measuring later improvements.
+
+
+1 June 2026 - Colour Compatibility and Startup Debugging
+--------------------------------------------------------
+
+What changed:
+I corrected the rendering palette so sky, terrain, UI backgrounds, and
+transparent blocks display their intended colours.
+
+Why the change was needed:
+The application initially launched into a white-looking scene despite reaching
+the main game loop successfully.
+
+Technical challenge:
+The runtime logs did not report a crash. The problem was a visual compatibility
+issue in the colour values.
+
+Solution:
+I inspected the installed Ursina colour API and added RGB conversion helpers
+that translate readable 0-255 colour definitions into the 0.0-1.0 range expected
+by the engine.
+
+What I learned:
+When a window is responsive but visually wrong, the problem may be in scene
+data rather than application startup. Inspecting the installed library version
+is sometimes more reliable than relying on assumptions about an API.
+
+
+1 June 2026 - Visible-Face Mesh Optimisation
+--------------------------------------------
+
+What changed:
+I replaced the per-block cube renderer with combined meshes that contain only
+visible voxel faces. Opaque and transparent blocks are handled separately.
+
+Why the change was needed:
+Creating separate entities and colliders for many blocks caused slow startup,
+high scene complexity, and poor frame rate.
+
+Technical challenge:
+Removing individual block entities meant the renderer could no longer depend on
+one cube object per voxel.
+
+Solution:
+I generated mesh vertices, triangles, normals, and colours directly from
+world_data. Faces shared by adjacent solid blocks are omitted. I also corrected
+the triangle winding so the exterior side of each face is rendered.
+
+What I learned:
+Voxel rendering performance depends heavily on representing surfaces rather
+than individual cubes. Hidden geometry is an avoidable cost.
+
+
+1 June 2026 - Dirty Chunk Rebuilding for Smooth Editing
+-------------------------------------------------------
+
+What changed:
+I divided the world into chunks and changed mining and placement so they queue
+only affected chunk meshes for rebuilding. Border edits also queue neighbouring
+chunks. Rebuild work is limited per frame.
+
+Why the change was needed:
+Breaking or placing a block still caused stutter because the full visible world
+mesh was rebuilt synchronously.
+
+Technical challenge:
+A single edit can affect more than one chunk when it changes a face along a
+chunk boundary.
+
+Solution:
+I added chunk coordinate conversion, per-chunk block indexes, a dirty chunk set,
+and a deduplicated rebuild queue. The update loop processes a small number of
+dirty chunks each frame.
+
+What I learned:
+Local gameplay actions should trigger local updates. Queueing and deduplication
+are effective ways to spread expensive work across frames.
+
+
+1 June 2026 - Streamed Chunk World Architecture
+-----------------------------------------------
+
+What changed:
+I expanded the chunk system into a streamed world architecture. Nearby chunks
+are generated and rendered around the player. Distant chunk mesh entities are
+destroyed gradually. Block data remains stored in memory, and generated chunk
+coordinates are included in save files.
+
+Why the change was needed:
+A fixed rendered world does not scale well as the player explores. The game
+needed to distinguish between known world data and active visual chunks.
+
+Technical challenge:
+Chunks had to unload visually without losing mined or placed blocks. New chunk
+work also needed to be gradual to avoid freezing the game loop.
+
+Solution:
+I separated permanent world data from active chunk mesh entities. The scheduler
+queues unknown nearby chunks for deterministic generation, activates visible
+chunks, unloads distant meshes, and limits generation, rebuilding, and unloading
+work per frame.
+
+What I learned:
+Streaming systems are primarily about lifecycle management. Generation,
+storage, rendering, and unloading need to be treated as separate concerns.
+
+
+1 June 2026 - Accurate Chunk Mesh Interaction
+---------------------------------------------
+
+What changed:
+I strengthened breaking and placement for combined chunk meshes by attaching
+explicit metadata to chunk mesh entities and filtering interaction raycasts so
+they accept only valid chunk colliders.
+
+Why the change was needed:
+A combined chunk mesh represents many blocks, so interaction cannot depend on a
+block entity property.
+
+Technical challenge:
+The game needed to identify the correct voxel coordinate from a raycast against
+a shared collider, including faces at chunk borders.
+
+Solution:
+The game samples slightly inside a hit face for mining and slightly outside for
+placement, then converts the result back into an integer block coordinate. Mesh
+metadata makes the interaction contract explicit.
+
+What I learned:
+Optimised rendering does not need to reduce gameplay accuracy. The right
+coordinate conversion preserves precise editing while using batched meshes.
+
+
+1 June 2026 - Ceiling Collision Fix
+-----------------------------------
+
+What changed:
+I added explicit ceiling collision handling for jumping beneath tree canopies
+and other overhead blocks.
+
+Why the change was needed:
+The Ursina first-person controller allowed the upward jump animation to move
+the player into an overhead block, leaving the player stuck inside the mesh.
+
+Technical challenge:
+The default controller checked the ground and horizontal movement but did not
+cancel its animated upward motion when the player's head reached a ceiling.
+
+Solution:
+I added an upward raycast from the player against chunk mesh colliders. When the
+player reaches an underside face, the game moves the player just below it,
+pauses the jump tween, cancels upward movement, and lets gravity resume.
+
+What I learned:
+Engine prefabs are useful starting points, but they still need to be audited
+against the specific collision requirements of the game.
+
+
+1 June 2026 - Chunk-Aware Saves and Interactive Inventory
+----------------------------------------------------------
+
+What changed:
+I updated the JSON save format so known world blocks are grouped by chunk. I
+also added an inventory overlay that opens with E, shows item names and
+quantities in a slot grid, releases the mouse cursor, pauses first-person
+control, and allows block selection by clicking a slot.
+
+Why the change was needed:
+The streamed world architecture needed a save structure that reflected its
+chunk-based design. The hotbar was useful during early development, but a
+visible inventory screen made item counts easier to understand and provided a
+cleaner interaction pattern for selecting blocks.
+
+Technical challenge:
+Loading needed to reconstruct chunk indexes correctly before nearby chunk
+meshes were activated. The inventory also needed to pause camera movement and
+prevent mining clicks from passing through the UI without breaking the existing
+number-key hotbar shortcuts. Ursina development mode also reserved F9 for code
+hot-reloading, which conflicted with the game's world-load shortcut.
+
+Solution:
+The save file now stores chunk-grouped block dictionaries, generated chunk
+coordinates, inventory data, selection state, survival statistics, and player
+position. The loader still accepts older flat saves for compatibility. The
+inventory overlay uses Ursina UI entities and buttons, toggles mouse locking and
+controller state, and routes clicks only to inventory selection while open.
+Ursina development mode is disabled so F9 performs only the game's chunk-aware
+load operation.
+
+What I learned:
+Data formats should evolve alongside architecture. I also learned that an
+interface overlay needs input-state management, not only visual elements, to
+feel correct in a first-person game.
+
+
+1 June 2026 - Interactive 2x2 Crafting Interface
+------------------------------------------------
+
+What changed:
+I replaced the shortcut-only crafting actions with an interactive crafting
+area inside the inventory screen. The overlay now includes inventory item
+slots, a 2x2 input grid, a live output slot, and visible recipe hints. The
+existing number-key hotbar remains available during gameplay.
+
+Why the change was needed:
+Keyboard shortcuts were useful while prototyping recipes, but they did not
+demonstrate the relationship between ingredients, patterns, and crafted
+results. A visible grid makes crafting understandable without requiring the
+player to memorise controls.
+
+Technical challenge:
+The first version needed click-based movement without introducing a complex
+drag-and-drop stack system. It also needed to avoid losing items if the player
+closed the screen while holding an ingredient or left an unfinished recipe in
+the grid.
+
+Solution:
+The inventory uses a deliberately small interaction model. Clicking an item
+picks up one unit, clicking a grid slot places or swaps that unit, and clicking
+the output collects a result only when the exact 2x2 pattern matches a recipe.
+Three recipes are supported: glass, wood, and compressed stone. Any unfinished
+ingredients are returned to the inventory when the overlay closes.
+
+What I learned:
+A focused interface can still feel interactive without implementing every
+feature of a full inventory system. Defining recipes as data-driven grid
+patterns also keeps the crafting rules easy to extend.
+
+
+1 June 2026 - Targeted Block Outline
+------------------------------------
+
+What changed:
+I added a thin yellow outline around the block currently under the crosshair.
+The outline follows the player's aim, disappears when no valid block is
+targeted, and stays hidden while the inventory screen is open.
+
+Why the change was needed:
+Breaking and placing blocks already worked accurately, but the player had no
+visual confirmation of which voxel would be edited. The outline makes the
+interaction range and selected block clear before an action is performed.
+
+Technical challenge:
+Chunks are rendered as combined meshes rather than individual block entities,
+so there was no block object available to highlight directly. The visual also
+needed to avoid interfering with interaction raycasts.
+
+Solution:
+The game reuses its existing chunk-mesh raycast and hit-to-voxel coordinate
+conversion. A single reusable, slightly oversized wireframe cube is moved to
+the resulting coordinate only when that coordinate exists in world data. The
+outline has no collider, so it does not affect mining, placement, or chunk
+rebuilding.
+
+What I learned:
+Small interaction cues can make a system feel much more precise. Reusing the
+same coordinate calculation as the gameplay action also prevents the visual
+feedback from drifting away from the actual result.
+
+
+1 June 2026 - Deterministic Tree Density Tuning
+-----------------------------------------------
+
+What changed:
+I reduced the procedural tree spawn chance and added a minimum spacing rule so
+the terrain is easier to walk through. Forests still appear naturally, but
+trees no longer crowd nearly every route through the world.
+
+Why the change was needed:
+The original tree probability produced visually dense areas that made normal
+exploration and navigation awkward. Tree density needed to be adjustable
+without removing the environmental variety entirely.
+
+Technical challenge:
+The world generates chunks gradually as the player moves. A spacing rule based
+only on trees already present in memory could produce different results
+depending on the order in which chunks were loaded.
+
+Solution:
+I introduced clear tree spawn chance and minimum spacing constants near the
+world settings. Each possible tree location is evaluated deterministically
+from the world seed and coordinates. When nearby candidates compete for the
+same area, only the strongest local candidate remains, regardless of chunk
+generation order.
+
+What I learned:
+Procedural generation rules should be independent of streaming order. Local,
+seed-based decisions keep the world reproducible while still allowing useful
+design tuning.
+
+
+1 June 2026 - Main Menu, Pause Flow, and Live Settings
+------------------------------------------------------
+
+What changed:
+I added a main menu so the game no longer starts directly in active gameplay.
+The launch screen provides Singleplayer, Multiplayer, Settings, and Quit Game
+options. Multiplayer is presented honestly as a planned future feature through
+a Coming Soon panel rather than incomplete networking code. I also changed Esc
+so it opens an in-game pause menu instead of quitting immediately.
+
+The pause menu includes Resume Game, Settings, Save Game, Return to Main Menu,
+and Quit Game. A shared settings screen now adjusts live mouse sensitivity and
+render distance, toggles fullscreen mode, and controls FPS and coordinate
+diagnostics.
+
+Why the change was needed:
+The prototype had grown beyond a single gameplay screen. Immediate startup and
+an instant-quit Esc key made the project feel less complete and left no clear
+place for settings or future features.
+
+Technical challenge:
+Menu overlays needed to stop player movement, camera look, mining, placement,
+hotbar shortcuts, inventory access, and the targeted-block outline without
+breaking the existing gameplay systems. Settings also needed to return to the
+correct previous screen depending on whether they were opened from the launch
+menu or while paused.
+
+Solution:
+I introduced explicit menu and gameplay states with centralised transition
+functions. One synchronisation helper now controls mouse locking, HUD
+visibility, and interaction cues. Input handling routes Esc according to the
+active state, while the controller wrappers and gameplay update loop run only
+when first-person play is active.
+
+What I learned:
+As an interactive project grows, clear application states become as important
+as individual features. Centralising state transitions reduces accidental
+input leaks and makes later UI additions easier to reason about.
+
+
+1 June 2026 - Voxel Survival UI Presentation Pass
+-------------------------------------------------
+
+What changed:
+I redesigned the interface from a plain functional prototype into a more
+cohesive voxel survival presentation. The HUD now uses compact icon-style
+health and hunger indicators, the bottom hotbar has framed slots and a clearer
+selected state, and the selected block label has been reduced to a smaller
+readable summary above the hotbar.
+
+The inventory and crafting screen now uses a large framed workspace with a
+title bar, character preview panel, equipment placeholders, evenly spaced item
+slots, a mirrored hotbar row, a cleaner 2x2 crafting area, a highlighted output
+slot for valid recipes, and a small recipe information panel. I also restyled
+the main menu, pause menu, multiplayer notice, and settings screen so they
+share the same visual language. The pause menu includes a compact controls
+reference, while settings are organised with category-style tabs.
+
+Why the change was needed:
+The previous interface proved that the gameplay systems worked, but its plain
+boxes and large text did not communicate the level of care already present in
+the chunk renderer, crafting system, and menu state architecture. A consistent
+UI makes the prototype easier to understand and more suitable for portfolio
+review.
+
+Technical challenge:
+The presentation needed to improve without changing gameplay behaviour or
+creating UI objects repeatedly during the update loop. Inventory clicks,
+crafting output collection, hotbar selection, save/load, pause states, and
+settings controls all needed to keep their existing contracts.
+
+Solution:
+I introduced reusable UI styling constants and helper functions for panels,
+framed buttons, slots, and labels. The screens are created once during startup
+and the existing update function refreshes only dynamic text, icon colours,
+selection borders, and crafting output state.
+
+What I learned:
+UI polish is easier to maintain when visual decisions are expressed as shared
+components rather than repeated values. Presentation work can remain focused
+and low-risk when it respects the existing gameplay boundaries.
+
+
+============================================================
+END OF DEVELOPMENT DIARY
+============================================================
